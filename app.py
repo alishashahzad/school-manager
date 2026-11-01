@@ -6,6 +6,7 @@
 # reportlab>=4.0.0
 # pypdf>=4.0.0
 # pandas>=2.0.0
+# openpyxl>=3.1.0             # needed to read/write Excel (.xlsx) files
 # psycopg2-binary>=2.9.9      # optional: lets the app auto-create tables on deploy
 # =============================================================================
 #
@@ -963,6 +964,337 @@ def page_generator():
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Page 6: Bulk Import (Excel / CSV)
+# -----------------------------------------------------------------------------
+def clean_cell(value) -> str:
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    text = str(value).strip()
+    if text.lower() in ("nan", "nat", "none"):
+        return ""
+    if text.endswith(".0") and text[:-2].isdigit():
+        text = text[:-2]
+    return text
+
+
+def normalize_class(value) -> str:
+    text = clean_cell(value)
+    if not text:
+        return ""
+    if text.isdigit():
+        text = f"Class {int(text)}"
+    for c in CLASSES:
+        if c.lower() == text.lower():
+            return c
+    return text
+
+
+def read_upload(uploaded) -> pd.DataFrame:
+    if uploaded.name.lower().endswith(".csv"):
+        df = pd.read_csv(uploaded, dtype=str)
+    else:
+        df = pd.read_excel(uploaded, dtype=str)
+    df.columns = [str(c).strip() for c in df.columns]
+    return df.dropna(how="all")
+
+
+def _norm_col(name: str) -> str:
+    return str(name).lower().replace("_", " ").replace("'", "").replace("\u2019", "").strip()
+
+
+def find_col(df: pd.DataFrame, *names):
+    lookup = {_norm_col(c): c for c in df.columns}
+    for n in names:
+        if _norm_col(n) in lookup:
+            return lookup[_norm_col(n)]
+    return None
+
+
+def to_excel_bytes(df: pd.DataFrame, sheet: str) -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name=sheet, index=False)
+    return buf.getvalue()
+
+
+def chunked(items: list, size: int = 500):
+    for i in range(0, len(items), size):
+        yield items[i : i + size]
+
+
+def parse_date_cell(value):
+    text = clean_cell(value)
+    if not text:
+        return None
+    try:
+        return pd.to_datetime(text, dayfirst=True).date()
+    except Exception:
+        return None
+
+
+def parse_time_cell(value) -> str:
+    text = clean_cell(value)
+    if not text:
+        return ""
+    try:
+        return pd.to_datetime(text).strftime("%H:%M")
+    except Exception:
+        return ""
+
+
+def show_import_errors(errors: list):
+    if errors:
+        st.error(f"{len(errors)} row(s) have problems and will be skipped:")
+        st.write("\n".join(f"- {e}" for e in errors[:25]))
+        if len(errors) > 25:
+            st.caption(f"...and {len(errors) - 25} more.")
+
+
+def import_students_tab():
+    client = get_client()
+    sample = pd.DataFrame(
+        {
+            "Roll Number": ["1", "2", "3"],
+            "Student Name": ["Ali Raza", "Sara Khan", "Hina Malik"],
+            "Father Name": ["Raza Ahmed", "Imran Khan", "Tariq Malik"],
+            "Class": ["Class 5", "Class 5", "Class 5"],
+        }
+    )
+    st.download_button(
+        "⬇️ Download sample Excel (Students)", to_excel_bytes(sample, "Students"),
+        file_name="students_sample.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_stu_sample",
+    )
+    st.caption("Columns needed: Roll Number, Student Name, Father Name, Class. Existing roll numbers are updated.")
+    uploaded = st.file_uploader("Upload students file (.xlsx or .csv)", type=["xlsx", "csv"], key="imp_students")
+    if uploaded is None:
+        return
+    try:
+        df = read_upload(uploaded)
+    except Exception as exc:
+        st.error(f"Could not read the file: {exc}")
+        return
+
+    c_roll = find_col(df, "roll number", "roll no", "roll")
+    c_name = find_col(df, "student name", "name")
+    c_father = find_col(df, "father name", "fathers name", "father")
+    c_class = find_col(df, "class")
+    missing = [lbl for lbl, col in [("Roll Number", c_roll), ("Student Name", c_name), ("Father Name", c_father), ("Class", c_class)] if col is None]
+    if missing:
+        st.error("Missing column(s): " + ", ".join(missing))
+        return
+
+    rows, errors, seen = [], [], set()
+    for idx, r in df.iterrows():
+        line = idx + 2
+        roll, name, father = clean_cell(r[c_roll]), clean_cell(r[c_name]), clean_cell(r[c_father])
+        cls = normalize_class(r[c_class])
+        if not (roll and name and father):
+            errors.append(f"Row {line}: Roll Number, Student Name and Father Name are required.")
+        elif cls not in CLASSES:
+            errors.append(f"Row {line}: unknown class '{cls}'. Use one of: {', '.join(CLASSES)}.")
+        elif roll in seen:
+            errors.append(f"Row {line}: Roll Number '{roll}' appears twice in the file.")
+        else:
+            seen.add(roll)
+            rows.append({"roll_number": roll, "name": name, "father_name": father, "class_name": cls})
+
+    show_import_errors(errors)
+    if rows:
+        st.success(f"{len(rows)} student(s) ready to import.")
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+        if st.button("Import Students", type="primary", key="btn_imp_students"):
+            try:
+                old = {s["roll_number"]: s["class_name"] for s in fetch_all("students")}
+                for chunk in chunked(rows):
+                    client.table("students").upsert(chunk, on_conflict="roll_number").execute()
+                for r in rows:
+                    if r["roll_number"] in old and old[r["roll_number"]] != r["class_name"]:
+                        client.table("results").update({"class_name": r["class_name"]}).eq("roll_number", r["roll_number"]).execute()
+                st.success(f"Imported {len(rows)} student(s).")
+            except Exception as exc:
+                st.error(f"Database error: {exc}")
+
+
+def import_timetable_tab():
+    client = get_client()
+    sample = pd.DataFrame(
+        {
+            "Class": ["Class 5"] * 3,
+            "Subject": ["English", "Urdu", "Mathematics"],
+            "Exam Date": ["2026-12-15", "2026-12-16", "2026-12-17"],
+            "Exam Time": ["09:00 AM", "09:00 AM", "09:00 AM"],
+        }
+    )
+    st.download_button(
+        "⬇️ Download sample Excel (Timetable)", to_excel_bytes(sample, "Timetable"),
+        file_name="timetable_sample.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_tt_sample",
+    )
+    st.caption("Columns needed: Class, Subject, Exam Date, Exam Time. Dates like 2026-12-15 or 15-12-2026 both work.")
+    uploaded = st.file_uploader("Upload timetable file (.xlsx or .csv)", type=["xlsx", "csv"], key="imp_timetable")
+    if uploaded is None:
+        return
+    try:
+        df = read_upload(uploaded)
+    except Exception as exc:
+        st.error(f"Could not read the file: {exc}")
+        return
+
+    c_class = find_col(df, "class")
+    c_subject = find_col(df, "subject")
+    c_date = find_col(df, "exam date", "date")
+    c_time = find_col(df, "exam time", "time")
+    missing = [lbl for lbl, col in [("Class", c_class), ("Subject", c_subject), ("Exam Date", c_date), ("Exam Time", c_time)] if col is None]
+    if missing:
+        st.error("Missing column(s): " + ", ".join(missing))
+        return
+
+    rows, errors = [], []
+    for idx, r in df.iterrows():
+        line = idx + 2
+        cls, subject = normalize_class(r[c_class]), clean_cell(r[c_subject])
+        d, t = parse_date_cell(r[c_date]), parse_time_cell(r[c_time])
+        if cls not in CLASSES:
+            errors.append(f"Row {line}: unknown class '{cls}'.")
+        elif not subject:
+            errors.append(f"Row {line}: Subject is empty.")
+        elif d is None:
+            errors.append(f"Row {line}: Exam Date '{clean_cell(r[c_date])}' is not a valid date.")
+        elif not t:
+            errors.append(f"Row {line}: Exam Time '{clean_cell(r[c_time])}' is not a valid time.")
+        else:
+            rows.append({"class_name": cls, "subject": subject, "exam_date": d.isoformat(), "exam_time": t})
+
+    show_import_errors(errors)
+    if rows:
+        st.success(f"{len(rows)} exam entr(ies) ready to import.")
+        preview = pd.DataFrame(rows).assign(exam_time=lambda x: x["exam_time"].map(fmt_time))
+        st.dataframe(preview, hide_index=True, width="stretch")
+        replace = st.checkbox("Delete the existing timetable of these classes first (avoids duplicates)", value=True, key="tt_replace")
+        if st.button("Import Timetable", type="primary", key="btn_imp_tt"):
+            try:
+                if replace:
+                    for cls in sorted({r["class_name"] for r in rows}):
+                        client.table("timetable").delete().eq("class_name", cls).execute()
+                for chunk in chunked(rows):
+                    client.table("timetable").insert(chunk).execute()
+                st.success(f"Imported {len(rows)} exam entr(ies).")
+            except Exception as exc:
+                st.error(f"Database error: {exc}")
+
+
+def import_marks_tab():
+    client = get_client()
+    sample = pd.DataFrame(
+        {
+            "Roll Number": ["1", "2", "3"],
+            "Student Name": ["Ali Raza", "Sara Khan", "Hina Malik"],
+            "English": [72, 88, 65],
+            "Urdu": [65, 91, 70],
+            "Mathematics": [30, 95, 62],
+        }
+    )
+    st.download_button(
+        "⬇️ Download sample Excel (Marks)", to_excel_bytes(sample, "Marks"),
+        file_name="marks_sample.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_marks_sample",
+    )
+    st.caption(
+        "One row per student: a 'Roll Number' column, then one column per subject holding the marks obtained. "
+        "Students must already be registered. Empty cells are skipped."
+    )
+    total_marks = st.number_input("Total Marks for every subject in this file", min_value=1.0, value=100.0, step=1.0, key="imp_total")
+    uploaded = st.file_uploader("Upload marks file (.xlsx or .csv)", type=["xlsx", "csv"], key="imp_marks")
+    if uploaded is None:
+        return
+    try:
+        df = read_upload(uploaded)
+    except Exception as exc:
+        st.error(f"Could not read the file: {exc}")
+        return
+
+    c_roll = find_col(df, "roll number", "roll no", "roll")
+    if c_roll is None:
+        st.error("Missing column: Roll Number")
+        return
+    ignore = {
+        "roll number", "roll no", "roll", "student name", "name", "father name", "fathers name",
+        "father", "class", "sr", "sr no", "s no", "serial", "total", "percentage", "grade", "result",
+    }
+    subjects = [c for c in df.columns if _norm_col(c) not in ignore and not str(c).lower().startswith("unnamed")]
+    if not subjects:
+        st.error("No subject columns found.")
+        return
+    st.info("Subjects detected: " + ", ".join(subjects))
+
+    try:
+        student_class = {s["roll_number"]: s["class_name"] for s in fetch_all("students")}
+    except Exception as exc:
+        st.error(f"Database error: {exc}")
+        return
+
+    payload, errors = {}, []
+    for idx, r in df.iterrows():
+        line = idx + 2
+        roll = clean_cell(r[c_roll])
+        if not roll:
+            errors.append(f"Row {line}: Roll Number is empty.")
+            continue
+        if roll not in student_class:
+            errors.append(f"Row {line}: Roll Number '{roll}' is not registered.")
+            continue
+        for subj in subjects:
+            text = clean_cell(r[subj])
+            if not text:
+                continue
+            try:
+                val = float(text)
+            except ValueError:
+                errors.append(f"Row {line}, {subj}: '{text}' is not a number.")
+                continue
+            if val < 0 or val > total_marks:
+                errors.append(f"Row {line}, {subj}: {val:g} is outside 0 - {total_marks:g}.")
+                continue
+            payload[(roll, subj.strip())] = {
+                "roll_number": roll,
+                "class_name": student_class[roll],
+                "subject": subj.strip(),
+                "marks_obtained": val,
+                "total_marks": float(total_marks),
+                "updated_at": datetime.utcnow().isoformat(),
+            }
+
+    show_import_errors(errors)
+    rows = list(payload.values())
+    if rows:
+        st.success(f"{len(rows)} mark entr(ies) ready to import.")
+        st.dataframe(
+            pd.DataFrame(rows)[["roll_number", "class_name", "subject", "marks_obtained", "total_marks"]],
+            hide_index=True, width="stretch",
+        )
+        if st.button("Import Marks", type="primary", key="btn_imp_marks"):
+            try:
+                for chunk in chunked(rows):
+                    client.table("results").upsert(chunk, on_conflict="roll_number,subject").execute()
+                st.success(f"Imported {len(rows)} mark entr(ies).")
+            except Exception as exc:
+                st.error(f"Database error: {exc}")
+
+
+def page_import():
+    st.title("📥 Bulk Import (Excel / CSV)")
+    st.caption("Upload your school's existing Excel sheets. Import in this order: Students → Timetable → Marks.")
+    tab1, tab2, tab3 = st.tabs(["1. Students", "2. Timetable", "3. Marks"])
+    with tab1:
+        import_students_tab()
+    with tab2:
+        import_timetable_tab()
+    with tab3:
+        import_marks_tab()
+
+
 def main():
     sidebar_connection()
     client = get_client()
@@ -982,6 +1314,7 @@ def main():
             "3. Marks Entry",
             "4. Custom Layout Upload",
             "5. Document Generator",
+            "6. Bulk Import (Excel/CSV)",
         ],
     )
 
@@ -993,8 +1326,10 @@ def main():
         page_marks()
     elif page.startswith("4"):
         page_layouts()
-    else:
+    elif page.startswith("5"):
         page_generator()
+    else:
+        page_import()
 
 
 main()
