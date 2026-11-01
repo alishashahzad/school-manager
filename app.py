@@ -26,6 +26,7 @@ import base64
 import copy
 import io
 import os
+import re
 from datetime import date, datetime, time as dtime
 
 import pandas as pd
@@ -100,14 +101,14 @@ NOTIFY pgrst, 'reload schema';
 DEFAULT_LAYOUTS = {
     "admit": {
         "fields": {
-            "student_name": {"label": "Student Name", "x": 150.0, "y": 640.0, "size": 12.0},
-            "father_name": {"label": "Father's Name", "x": 150.0, "y": 615.0, "size": 12.0},
-            "roll_number": {"label": "Roll Number", "x": 150.0, "y": 590.0, "size": 12.0},
-            "class_name": {"label": "Class", "x": 400.0, "y": 590.0, "size": 12.0},
+            "student_name": {"label": "Student Name", "x": 140.0, "y": 650.0, "size": 12.0},
+            "class_name": {"label": "Class", "x": 400.0, "y": 650.0, "size": 12.0},
+            "father_name": {"label": "Father's Name", "x": 140.0, "y": 620.0, "size": 12.0},
+            "roll_number": {"label": "Roll No", "x": 400.0, "y": 620.0, "size": 12.0},
         },
         "table": {
-            "x_subject": 90.0, "x_date": 300.0, "x_time": 430.0,
-            "y_start": 520.0, "row_height": 22.0, "size": 11.0, "max_rows": 12.0,
+            "x_subject": 55.0, "x_time": 150.0, "x_date": 290.0, "x_day": 370.0,
+            "y_start": 530.0, "row_height": 26.0, "size": 10.0, "max_rows": 10.0,
         },
     },
     "result": {
@@ -273,10 +274,24 @@ def fmt_date(value) -> str:
 
 
 def fmt_time(value) -> str:
+    """'HH:MM' -> '09:00 AM'; 'HH:MM-HH:MM' -> '09:00 AM to 11:30 AM'."""
+    parts = str(value).strip().split("-")
+    out = []
+    for part in parts[:2]:
+        try:
+            out.append(datetime.strptime(part.strip()[:5], "%H:%M").strftime("%I:%M %p"))
+        except Exception:
+            return str(value)
+    return " to ".join(out)
+
+
+def fmt_weekday(value) -> str:
     try:
-        return datetime.strptime(str(value)[:5], "%H:%M").strftime("%I:%M %p")
+        if isinstance(value, (date, datetime)):
+            return value.strftime("%A")
+        return datetime.strptime(str(value)[:10], "%Y-%m-%d").strftime("%A")
     except Exception:
-        return str(value)
+        return ""
 
 
 def fmt_num(value) -> str:
@@ -436,6 +451,8 @@ def make_admit_drawer(student: dict, exams: list, layout: dict):
             draw_text(c, exam["subject"], t["x_subject"], y, t["size"])
             draw_text(c, fmt_date(exam["exam_date"]), t["x_date"], y, t["size"])
             draw_text(c, fmt_time(exam["exam_time"]), t["x_time"], y, t["size"])
+            if "x_day" in t:
+                draw_text(c, fmt_weekday(exam["exam_date"]), t["x_day"], y, t["size"])
             y -= float(t["row_height"])
 
     return drawer
@@ -508,25 +525,33 @@ def page_timetable():
         class_name = c1.selectbox("Class", CLASSES)
         subject_pick = c2.selectbox("Subject", DEFAULT_SUBJECTS)
         custom_subject = c2.text_input("Custom subject (overrides dropdown if filled)")
-        c3, c4 = st.columns(2)
+        c3, c4, c5 = st.columns(3)
         exam_date = c3.date_input("Exam Date", value=date.today())
-        exam_time = c4.time_input("Exam Time", value=dtime(9, 0))
+        exam_time = c4.time_input("Exam Start Time", value=dtime(9, 0))
+        end_time = c5.time_input("Exam End Time", value=dtime(11, 30))
+        use_end = st.checkbox("Print the end time too (e.g. 09:00 AM to 11:30 AM)", value=True)
         submitted = st.form_submit_button("Save Schedule")
 
     if submitted:
         subject = custom_subject.strip() or subject_pick
-        try:
-            client.table("timetable").insert(
-                {
-                    "class_name": class_name,
-                    "subject": subject,
-                    "exam_date": exam_date.isoformat(),
-                    "exam_time": exam_time.strftime("%H:%M"),
-                }
-            ).execute()
-            st.success(f"Saved: {class_name} - {subject} on {fmt_date(exam_date)} at {fmt_time(exam_time.strftime('%H:%M'))}")
-        except Exception as exc:
-            st.error(f"Database error: {exc}")
+        time_value = exam_time.strftime("%H:%M")
+        if use_end:
+            time_value += "-" + end_time.strftime("%H:%M")
+        if use_end and end_time <= exam_time:
+            st.error("End time must be later than the start time.")
+        else:
+            try:
+                client.table("timetable").insert(
+                    {
+                        "class_name": class_name,
+                        "subject": subject,
+                        "exam_date": exam_date.isoformat(),
+                        "exam_time": time_value,
+                    }
+                ).execute()
+                st.success(f"Saved: {class_name} - {subject}, {fmt_weekday(exam_date)} {fmt_date(exam_date)}, {fmt_time(time_value)}")
+            except Exception as exc:
+                st.error(f"Database error: {exc}")
 
     st.divider()
     st.subheader("View Exam Schedules")
@@ -794,6 +819,15 @@ def layout_editor(doc_key: str):
         except Exception as exc:
             st.error(f"Database error: {exc}")
 
+    if st.button("Reset to default coordinates", key=f"{doc_key}_reset"):
+        try:
+            get_client().table("layout_settings").delete().eq("key", f"layout_{doc_key}").execute()
+            for k in [k for k in list(st.session_state.keys()) if str(k).startswith(f"{doc_key}_")]:
+                st.session_state.pop(k, None)
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Database error: {exc}")
+
     grid = st.checkbox("Show coordinate grid on preview", value=True, key=f"{doc_key}_grid")
     if st.button(f"Generate {DOC_TITLES[doc_key]} Preview", key=f"{doc_key}_preview_btn"):
         try:
@@ -1033,14 +1067,34 @@ def parse_date_cell(value):
         return None
 
 
+def _parse_one_time(text: str) -> str:
+    m = re.match(r"^(\d{1,2})\s*[:.]\s*(\d{2})(?:\s*[:.]\s*\d{2})?\s*([ap])?\.?m?\.?$", text.strip().lower())
+    if not m:
+        try:
+            return pd.to_datetime(text).strftime("%H:%M")
+        except Exception:
+            return ""
+    hour, minute, mer = int(m.group(1)), int(m.group(2)), m.group(3)
+    if minute > 59 or hour > 23:
+        return ""
+    if mer and hour <= 12:
+        if mer == "p" and hour < 12:
+            hour += 12
+        if mer == "a" and hour == 12:
+            hour = 0
+    return f"{hour:02d}:{minute:02d}"
+
+
 def parse_time_cell(value) -> str:
+    """Returns 'HH:MM' or 'HH:MM-HH:MM' (start-end), or '' if invalid."""
     text = clean_cell(value)
     if not text:
         return ""
-    try:
-        return pd.to_datetime(text).strftime("%H:%M")
-    except Exception:
+    parts = [p for p in re.split(r"\s+to\s+|\s*[-\u2013\u2014]\s*", text, flags=re.I) if p.strip()]
+    times = [_parse_one_time(p) for p in parts]
+    if not times or len(times) > 2 or "" in times:
         return ""
+    return "-".join(times)
 
 
 def show_import_errors(errors: list):
@@ -1132,7 +1186,8 @@ def import_timetable_tab():
         file_name="timetable_sample.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key="dl_tt_sample",
     )
-    st.caption("Columns needed: Class, Subject, Exam Date, Exam Time. Dates like 2026-12-15 or 15-12-2026 both work.")
+    st.caption("Columns needed: Class, Subject, Exam Date, Exam Time. Dates like 2026-12-15 or 15-12-2026 both work. "
+        "Exam Time can be a range such as '09:00am to 11:30am'. The day name (Monday...) is printed automatically from the date.")
     uploaded = st.file_uploader("Upload timetable file (.xlsx or .csv)", type=["xlsx", "csv"], key="imp_timetable")
     if uploaded is None:
         return
